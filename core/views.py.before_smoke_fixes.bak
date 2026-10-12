@@ -1,0 +1,919 @@
+
+import json
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from django.core.paginator import Paginator
+from django.db import transaction, IntegrityError
+from django.db.models import Q, Max
+from django.http import JsonResponse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+from .models import Dealer, Inventory, Product, Order, OrderItem
+
+
+CENT = Decimal("0.01")
+GST_RATE = Decimal("18.00")
+
+
+# --------------------------------------------------
+# Common helpers
+# --------------------------------------------------
+
+def error_response(code, message, status=400, details=None):
+    return JsonResponse(
+        {
+            "error": {
+                "code": code,
+                "message": message,
+                "details": details or [],
+            }
+        },
+        status=status,
+    )
+
+
+def parse_json_body(request):
+    try:
+        payload = json.loads(request.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, error_response(
+            "VALIDATION_ERROR", "Invalid JSON body"
+        )
+
+    if not isinstance(payload, dict):
+        return None, error_response(
+            "VALIDATION_ERROR", "JSON body must be an object"
+        )
+
+    return payload, None
+
+
+def money(value):
+    return format(Decimal(value).quantize(CENT), ".2f")
+
+
+def decimal_value(value, field_name, positive=False):
+    try:
+        if isinstance(value, bool):
+            raise InvalidOperation
+
+        number = Decimal(str(value))
+
+        if not number.is_finite():
+            raise InvalidOperation
+
+        if positive and number <= 0:
+            raise InvalidOperation
+
+        if not positive and number < 0:
+            raise InvalidOperation
+
+        if number.as_tuple().exponent < -2:
+            raise InvalidOperation
+
+        return number.quantize(CENT), None
+
+    except (InvalidOperation, ValueError, TypeError):
+        qualifier = "positive" if positive else "non-negative"
+        return None, error_response(
+            "VALIDATION_ERROR",
+            f"{field_name} must be a {qualifier} number with at most two decimal places",
+        )
+
+
+def paginate(request, queryset, serializer):
+    try:
+        page_number = int(request.GET.get("page", "1"))
+        page_size = int(request.GET.get("page_size", "20"))
+    except (ValueError, TypeError):
+        return error_response(
+            "VALIDATION_ERROR", "page and page_size must be integers"
+        )
+
+    if page_number < 1 or page_size < 1:
+        return error_response(
+            "VALIDATION_ERROR", "page and page_size must be positive"
+        )
+
+    page_size = min(page_size, 100)
+    paginator = Paginator(queryset, page_size)
+    page = paginator.get_page(page_number)
+
+    return JsonResponse({
+        "count": paginator.count,
+        "next": (
+            page.next_page_number()
+            if page.has_next()
+            else None
+        ),
+        "previous": (
+            page.previous_page_number()
+            if page.has_previous()
+            else None
+        ),
+        "results": [serializer(obj) for obj in page.object_list],
+    })
+
+
+def product_data(product):
+    inventory = getattr(product, "inventory", None)
+
+    return {
+        "sku": product.sku,
+        "name": product.name,
+        "category": product.category,
+        "brand": product.brand,
+        "vehicle_fitment": product.vehicle_fitment,
+        "price": money(product.unit_price),
+        "stock": inventory.quantity if inventory else 0,
+        "description": product.description,
+    }
+
+
+def dealer_data(dealer):
+    return {
+        # The current model uses dealer_code as its primary key.
+        # Numeric dealer IDs require a model migration.
+        "id": dealer.dealer_code,
+        "dealer_code": dealer.dealer_code,
+        "name": dealer.name,
+        "city": dealer.city,
+        "phone": dealer.phone,
+        "email": dealer.email,
+        "gstin": dealer.gstin,
+        "credit_limit": money(dealer.credit_limit),
+    }
+
+
+def order_data(order):
+    items = []
+
+    for item in order.items.select_related("product").all():
+        line_subtotal = (
+            item.unit_price * item.quantity
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        line_tax = (
+            line_subtotal * GST_RATE / Decimal("100")
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        items.append({
+            "sku": item.product.sku,
+            "name": item.product.name,
+            "quantity": item.quantity,
+            "unit_price": money(item.unit_price),
+            "line_subtotal": money(line_subtotal),
+            "line_tax": money(line_tax),
+            "line_total": money(line_subtotal + line_tax),
+        })
+
+    return {
+        "order_number": order.order_number,
+        "dealer_id": order.dealer.dealer_code,
+        "status": order.status,
+        "items": items,
+        "subtotal": money(order.subtotal),
+        "tax_total": money(order.gst_amount),
+        "grand_total": money(order.total_amount),
+        "created_at": order.created_at.isoformat(),
+        "updated_at": order.updated_at.isoformat(),
+    }
+
+
+def calculate_totals(items):
+    subtotal = Decimal("0.00")
+    tax_total = Decimal("0.00")
+
+    for item in items:
+        line_subtotal = (
+            item["unit_price"] * item["quantity"]
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        line_tax = (
+            line_subtotal * GST_RATE / Decimal("100")
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        item["gst_rate"] = GST_RATE
+        item["gst_amount"] = line_tax
+        item["line_total"] = line_subtotal + line_tax
+
+        subtotal += line_subtotal
+        tax_total += line_tax
+
+    return (
+        subtotal.quantize(CENT),
+        tax_total.quantize(CENT),
+        (subtotal + tax_total).quantize(CENT),
+    )
+
+
+def validate_order_items(raw_items):
+    if not isinstance(raw_items, list) or not raw_items:
+        return None, error_response(
+            "VALIDATION_ERROR", "items must be a non-empty list"
+        )
+
+    validated = []
+    seen = set()
+
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            return None, error_response(
+                "VALIDATION_ERROR", "Each item must be an object"
+            )
+
+        sku = entry.get("sku")
+        quantity = entry.get("quantity")
+
+        if not isinstance(sku, str) or not sku.strip():
+            return None, error_response(
+                "VALIDATION_ERROR", "Each item needs a valid SKU"
+            )
+
+        sku = sku.strip()
+
+        if sku in seen:
+            return None, error_response(
+                "VALIDATION_ERROR",
+                f"Duplicate SKU in order: {sku}",
+            )
+
+        seen.add(sku)
+
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, int)
+            or quantity < 1
+        ):
+            return None, error_response(
+                "VALIDATION_ERROR",
+                f"Quantity for {sku} must be a positive integer",
+            )
+
+        validated.append({"sku": sku, "quantity": quantity})
+
+    return validated, None
+
+
+def build_order_lines(validated_items):
+    skus = sorted(entry["sku"] for entry in validated_items)
+
+    products = {
+        product.sku: product
+        for product in Product.objects.select_for_update().filter(
+            sku__in=skus, is_active=True
+        ).order_by("sku")
+    }
+
+    if len(products) != len(skus):
+        missing = sorted(set(skus) - set(products))
+        return None, error_response(
+            "NOT_FOUND",
+            "One or more products were not found or are inactive",
+            404,
+            [{"sku": sku} for sku in missing],
+        )
+
+    lines = []
+
+    for entry in validated_items:
+        product = products[entry["sku"]]
+        lines.append({
+            "product": product,
+            "quantity": entry["quantity"],
+            "unit_price": product.unit_price,
+            "gst_rate": GST_RATE,
+        })
+
+    return lines, None
+
+
+def save_order_items(order, lines):
+    subtotal, tax_total, grand_total = calculate_totals(lines)
+
+    order.items.all().delete()
+
+    for line in lines:
+        line_subtotal = (
+            line["unit_price"] * line["quantity"]
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        line_tax = (
+            line_subtotal * GST_RATE / Decimal("100")
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        OrderItem.objects.create(
+            order=order,
+            product=line["product"],
+            quantity=line["quantity"],
+            unit_price=line["unit_price"],
+            gst_rate=GST_RATE,
+            gst_amount=line_tax,
+            line_total=line_subtotal + line_tax,
+        )
+
+    order.subtotal = subtotal
+    order.gst_amount = tax_total
+    order.total_amount = grand_total
+    order.save(update_fields=[
+        "subtotal", "gst_amount", "total_amount", "updated_at"
+    ])
+
+
+def next_order_number():
+    date_part = timezone.localtime().strftime("%Y%m%d")
+    prefix = f"ORD-{date_part}-"
+
+    # The unique constraint remains the final safeguard if two
+    # requests happen to generate the same number concurrently.
+    last_order = (
+        Order.objects.filter(order_number__startswith=prefix)
+        .aggregate(max_number=Max("order_number"))["max_number"]
+    )
+
+    sequence = int(last_order[-4:]) + 1 if last_order else 1
+
+    if sequence > 9999:
+        raise OverflowError("Daily order number limit reached")
+
+    return f"{prefix}{sequence:04d}"
+
+
+# --------------------------------------------------
+# Health
+# --------------------------------------------------
+
+@require_http_methods(["GET"])
+def health(request):
+    return JsonResponse({"status": "ok"})
+
+
+# --------------------------------------------------
+# Products
+# --------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def products(request):
+    if request.method == "GET":
+        queryset = Product.objects.all().order_by("name", "sku")
+
+        search = request.GET.get("search", "").strip()
+        category = request.GET.get("category", "").strip()
+        vehicle = request.GET.get("vehicle", "").strip()
+
+        if search:
+            queryset = queryset.filter(
+                Q(sku__icontains=search)
+                | Q(name__icontains=search)
+                | Q(brand__icontains=search)
+            )
+
+        if category:
+            queryset = queryset.filter(category=category)
+
+        if vehicle:
+            queryset = queryset.filter(
+                vehicle_fitment__icontains=vehicle
+            )
+
+        return paginate(request, queryset, product_data)
+
+    payload, error = parse_json_body(request)
+    if error:
+        return error
+
+    for field in ("sku", "name", "unit_price"):
+        if payload.get(field) in ("", None):
+            return error_response(
+                "VALIDATION_ERROR", f"{field} is required"
+            )
+
+    for field in (
+        "sku", "name", "category", "brand",
+        "vehicle_fitment", "description",
+    ):
+        if field in payload and not isinstance(payload[field], str):
+            return error_response(
+                "VALIDATION_ERROR", f"{field} must be a string"
+            )
+
+    sku = payload["sku"].strip()
+    name = payload["name"].strip()
+
+    if not sku or not name:
+        return error_response(
+            "VALIDATION_ERROR", "sku and name cannot be empty"
+        )
+
+    price, error = decimal_value(
+        payload["unit_price"], "price", positive=True
+    )
+    if error:
+        return error
+
+    active = payload.get("is_active", True)
+    if not isinstance(active, bool):
+        return error_response(
+            "VALIDATION_ERROR", "is_active must be true or false"
+        )
+
+    if Product.objects.filter(sku=sku).exists():
+        return error_response(
+            "DUPLICATE", "A product with this SKU already exists", 409
+        )
+
+    try:
+        with transaction.atomic():
+            product = Product.objects.create(
+                sku=sku,
+                name=name,
+                category=payload.get("category", ""),
+                brand=payload.get("brand", ""),
+                vehicle_fitment=payload.get("vehicle_fitment", ""),
+                description=payload.get("description", ""),
+                unit_price=price,
+                gst_rate=GST_RATE,
+                is_active=active,
+            )
+            Inventory.objects.get_or_create(
+                product=product, defaults={"quantity": 0}
+            )
+    except IntegrityError:
+        return error_response(
+            "DUPLICATE", "A product with this SKU already exists", 409
+        )
+
+    return JsonResponse(
+        {"product": product_data(product)}, status=201
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+def product_detail(request, sku):
+    product = Product.objects.filter(sku=sku).first()
+
+    if product is None:
+        return error_response("NOT_FOUND", "Product not found", 404)
+
+    if request.method == "GET":
+        return JsonResponse(product_data(product))
+
+    payload, error = parse_json_body(request)
+    if error:
+        return error
+
+    allowed = {
+        "name", "category", "brand", "vehicle_fitment",
+        "description", "unit_price", "is_active",
+    }
+
+    unknown = set(payload) - allowed
+    if unknown:
+        return error_response(
+            "VALIDATION_ERROR",
+            "Unknown fields",
+            details=[{"field": field} for field in sorted(unknown)],
+        )
+
+    for field in (
+        "name", "category", "brand", "vehicle_fitment", "description"
+    ):
+        if field in payload:
+            if not isinstance(payload[field], str):
+                return error_response(
+                    "VALIDATION_ERROR", f"{field} must be a string"
+                )
+            setattr(product, field, payload[field])
+
+    if "unit_price" in payload:
+        price, error = decimal_value(
+            payload["unit_price"], "price", positive=True
+        )
+        if error:
+            return error
+        product.unit_price = price
+
+    if "is_active" in payload:
+        if not isinstance(payload["is_active"], bool):
+            return error_response(
+                "VALIDATION_ERROR", "is_active must be true or false"
+            )
+        product.is_active = payload["is_active"]
+
+    product.save()
+    return JsonResponse(product_data(product))
+
+# --------------------------------------------------
+# Inventory
+# --------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def inventory_update(request, sku):
+    product = Product.objects.filter(sku=sku).first()
+
+    if product is None:
+        return error_response("NOT_FOUND", "Product not found", 404)
+
+    inventory = Inventory.objects.filter(product=product).first()
+
+    if request.method == "GET":
+        if inventory is None:
+            return error_response(
+                "NOT_FOUND", f"Inventory not found for {sku}", 404
+            )
+
+        return JsonResponse({
+            "sku": sku,
+            "quantity": inventory.quantity,
+        })
+
+    payload, error = parse_json_body(request)
+    if error:
+        return error
+
+    quantity = payload.get("quantity")
+
+    if (
+        isinstance(quantity, bool)
+        or not isinstance(quantity, int)
+        or quantity < 0
+    ):
+        return error_response(
+            "VALIDATION_ERROR",
+            "quantity must be a non-negative integer",
+        )
+
+    inventory, _ = Inventory.objects.update_or_create(
+        product=product, defaults={"quantity": quantity}
+    )
+
+    return JsonResponse({
+        "sku": sku,
+        "quantity": inventory.quantity,
+    })
+
+
+# --------------------------------------------------
+# Dealers
+# --------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def dealers(request):
+    if request.method == "GET":
+        queryset = Dealer.objects.all().order_by("name", "dealer_code")
+        return paginate(request, queryset, dealer_data)
+
+    payload, error = parse_json_body(request)
+    if error:
+        return error
+
+    for field in ("dealer_code", "name"):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            return error_response(
+                "VALIDATION_ERROR",
+                f"{field} is required and must be a non-empty string",
+            )
+
+    credit_limit, error = decimal_value(
+        payload.get("credit_limit", "0"), "credit_limit"
+    )
+    if error:
+        return error
+
+    code = payload["dealer_code"].strip()
+
+    if Dealer.objects.filter(dealer_code=code).exists():
+        return error_response(
+            "DUPLICATE", "Dealer already exists", 409
+        )
+
+    dealer = Dealer.objects.create(
+        dealer_code=code,
+        name=payload["name"].strip(),
+        city=payload.get("city", ""),
+        phone=payload.get("phone", ""),
+        email=payload.get("email", ""),
+        gstin=payload.get("gstin", ""),
+        credit_limit=credit_limit,
+    )
+
+    return JsonResponse(dealer_data(dealer), status=201)
+
+@require_http_methods(["GET"])
+def dealer_detail(request, dealer_code):
+    dealer = Dealer.objects.filter(dealer_code=dealer_code).first()
+
+    if dealer is None:
+        return error_response("NOT_FOUND", "Dealer not found", 404)
+
+    return JsonResponse({"dealer": dealer_data(dealer)})
+
+
+# --------------------------------------------------
+# Orders: list and create
+# --------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def orders(request):
+    if request.method == "GET":
+        queryset = (
+            Order.objects.select_related("dealer")
+            .prefetch_related("items__product")
+            .order_by("-created_at")
+        )
+
+        dealer_code = request.GET.get("dealer_id")
+        status = request.GET.get("status")
+
+        if dealer_code:
+            queryset = queryset.filter(dealer_id=dealer_code)
+
+        if status:
+            queryset = queryset.filter(status=status)
+
+        return paginate(request, queryset, order_data)
+
+    payload, error = parse_json_body(request)
+    if error:
+        return error
+
+    dealer_code = payload.get("dealer_id", payload.get("dealer_code"))
+    if not dealer_code:
+        return error_response(
+            "VALIDATION_ERROR", "dealer_id is required"
+        )
+
+    validated, error = validate_order_items(payload.get("items"))
+    if error:
+        return error
+
+    try:
+        with transaction.atomic():
+            dealer = Dealer.objects.select_for_update().get(
+                dealer_code=str(dealer_code)
+            )
+
+            lines, error = build_order_lines(validated)
+            if error:
+                return error
+
+            subtotal, tax_total, grand_total = calculate_totals(lines)
+            order_number = next_order_number()
+
+            order = Order.objects.create(
+                order_number=order_number,
+                dealer=dealer,
+                status=Order.Status.DRAFT,
+                subtotal=subtotal,
+                gst_amount=tax_total,
+                total_amount=grand_total,
+            )
+
+            for line in lines:
+                line_subtotal = (
+                    line["unit_price"] * line["quantity"]
+                ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+                line_tax = (
+                    line_subtotal * GST_RATE / Decimal("100")
+                ).quantize(CENT, rounding=ROUND_HALF_UP)
+
+                OrderItem.objects.create(
+                    order=order,
+                    product=line["product"],
+                    quantity=line["quantity"],
+                    unit_price=line["unit_price"],
+                    gst_rate=GST_RATE,
+                    gst_amount=line_tax,
+                    line_total=line_subtotal + line_tax,
+                )
+
+    except Dealer.DoesNotExist:
+        return error_response("NOT_FOUND", "Dealer not found", 404)
+    except OverflowError as exc:
+        return error_response("ORDER_LIMIT_REACHED", str(exc), 409)
+    except IntegrityError:
+        return error_response(
+            "DUPLICATE",
+            "Could not allocate a unique order number; retry the request",
+            409,
+        )
+
+    return JsonResponse(order_data(order), status=201)
+
+
+# --------------------------------------------------
+# Order detail and draft editing
+# Add a matching URL in core/urls.py.
+# --------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["GET", "PUT"])
+def order_detail(request, order_number):
+    if request.method == "GET":
+        order = (
+            Order.objects.select_related("dealer")
+            .filter(order_number=order_number)
+            .first()
+        )
+        if order is None:
+            return error_response("NOT_FOUND", "Order not found", 404)
+
+        return JsonResponse({"order": order_data(order)})
+
+    payload, error = parse_json_body(request)
+    if error:
+        return error
+
+    validated, error = validate_order_items(payload.get("items"))
+    if error:
+        return error
+
+    with transaction.atomic():
+        order = (
+            Order.objects.select_for_update()
+            .filter(order_number=order_number)
+            .first()
+        )
+
+        if order is None:
+            return error_response("NOT_FOUND", "Order not found", 404)
+
+        if order.status != Order.Status.DRAFT:
+            return error_response(
+                "ORDER_LOCKED",
+                "Only draft orders can be edited",
+                409,
+            )
+
+        lines, error = build_order_lines(validated)
+        if error:
+            return error
+
+        save_order_items(order, lines)
+
+    return JsonResponse({"order": order_data(order)})
+
+
+# --------------------------------------------------
+# Order lifecycle actions
+# --------------------------------------------------
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def order_action(request, order_number, action):
+    if action not in {"confirm", "dispatch", "deliver", "cancel"}:
+        return error_response(
+            "VALIDATION_ERROR", "Unknown order action"
+        )
+
+    with transaction.atomic():
+        order = (
+            Order.objects.select_for_update()
+            .filter(order_number=order_number)
+            .first()
+        )
+
+        if order is None:
+            return error_response("NOT_FOUND", "Order not found", 404)
+
+        if action == "confirm":
+            if order.status != Order.Status.DRAFT:
+                return error_response(
+                    "INVALID_TRANSITION",
+                    "Only draft orders can be confirmed",
+                    409,
+                )
+
+            items = list(
+                order.items.select_related("product")
+                .order_by("product_id")
+            )
+
+            skus = [item.product_id for item in items]
+
+            inventories = {
+                inv.product_id: inv
+                for inv in Inventory.objects.select_for_update()
+                .filter(product_id__in=skus)
+                .order_by("product_id")
+            }
+
+            shortages = []
+
+            for item in items:
+                inventory = inventories.get(item.product_id)
+
+                if inventory is None:
+                    return error_response(
+                        "NOT_FOUND",
+                        f"Inventory not found for {item.product_id}",
+                        404,
+                    )
+
+                if inventory.quantity < item.quantity:
+                    shortages.append({
+                        "sku": item.product_id,
+                        "requested": item.quantity,
+                        "available": inventory.quantity,
+                    })
+
+            if shortages:
+                first = shortages[0]
+                product = next(
+                    i.product for i in items
+                    if i.product_id == first["sku"]
+                )
+                return error_response(
+                    "INSUFFICIENT_STOCK",
+                    (
+                        f"Insufficient stock for {product.name}. "
+                        f"Available: {first['available']}, "
+                        f"Requested: {first['requested']}"
+                    ),
+                    409,
+                    shortages,
+                )
+
+            # Deduct only after every line passes validation.
+            for item in items:
+                inventory = inventories[item.product_id]
+                inventory.quantity -= item.quantity
+                inventory.save(
+                    update_fields=["quantity", "updated_at"]
+                )
+
+            order.status = Order.Status.CONFIRMED
+
+        elif action == "dispatch":
+            if order.status != Order.Status.CONFIRMED:
+                return error_response(
+                    "INVALID_TRANSITION",
+                    "Only confirmed orders can be dispatched",
+                    409,
+                )
+            order.status = Order.Status.DISPATCHED
+
+        elif action == "deliver":
+            if order.status != Order.Status.DISPATCHED:
+                return error_response(
+                    "INVALID_TRANSITION",
+                    "Only dispatched orders can be delivered",
+                    409,
+                )
+            order.status = Order.Status.DELIVERED
+
+        elif action == "cancel":
+            if order.status not in (
+                Order.Status.DRAFT,
+                Order.Status.CONFIRMED,
+            ):
+                return error_response(
+                    "INVALID_TRANSITION",
+                    "Only draft or confirmed orders can be cancelled",
+                    409,
+                )
+
+            # Restore stock only if confirmation deducted it.
+            if order.status == Order.Status.CONFIRMED:
+                items = list(
+                    order.items.select_related("product")
+                    .order_by("product_id")
+                )
+
+                inventories = {
+                    inv.product_id: inv
+                    for inv in Inventory.objects.select_for_update()
+                    .filter(
+                        product_id__in=[i.product_id for i in items]
+                    )
+                    .order_by("product_id")
+                }
+
+                for item in items:
+                    inventory = inventories.get(item.product_id)
+
+                    if inventory is None:
+                        return error_response(
+                            "NOT_FOUND",
+                            f"Inventory not found for {item.product_id}",
+                            409,
+                        )
+
+                    inventory.quantity += item.quantity
+                    inventory.save(
+                        update_fields=["quantity", "updated_at"]
+                    )
+
+            order.status = Order.Status.CANCELLED
+
+        order.save(update_fields=["status", "updated_at"])
+
+    return JsonResponse({"order": order_data(order)})

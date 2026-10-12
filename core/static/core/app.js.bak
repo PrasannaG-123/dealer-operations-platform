@@ -1,0 +1,19 @@
+```javascript
+const $ = (id) => document.getElementById(id);
+
+let products = [];
+let productPage = 1;
+let productCount = 0;
+let searchTimer;
+let sessionId = "dealerdesk-" + Date.now();
+
+async function api(url, options = {}) {
+    const response = await fetch(url, {
+        ...options,
+        headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {})
+        }
+    });
+
+    const data = await response.json().

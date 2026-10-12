@@ -1,0 +1,78 @@
+﻿{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VIKMO DealerDesk</title>
+<link rel="stylesheet" href="{% static 'core/app.css' %}">
+<script src="{% static 'core/app.js' %}" defer></script>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand"><span class="brand-icon">V</span><div>VIKMO<small>DEALER DESK</small></div></div>
+  <p class="nav-label">WORKSPACE</p>
+  <button class="nav-item active" data-view="dashboard">Dashboard</button>
+  <button class="nav-item" data-view="products">Products</button>
+  <button class="nav-item" data-view="inventory">Inventory</button>
+  <button class="nav-item" data-view="orders">Orders</button>
+  <button class="nav-item" data-view="forecasts">Forecasts</button>
+  <button class="nav-item" data-view="assistant">AI Assistant</button>
+  <div class="sidebar-bottom"><span class="status-dot"></span> DealerDesk<small>VIKMO v1.0</small></div>
+</aside>
+<main class="main">
+<header class="topbar">
+  <div><span class="eyebrow">WORKSPACE / OVERVIEW</span><h1 id="page-title">Dashboard</h1></div>
+  <div class="top-actions"><span class="live">Live system</span><button class="icon-btn" id="refresh-btn">Refresh</button></div>
+</header>
+<div id="notice" role="status" aria-live="polite"></div>
+
+<section id="dashboard-view" class="view">
+  <div class="welcome"><div><span class="eyebrow">DEALER OPERATIONS</span><h2>Your business at a glance.</h2><p>Products, stock, orders and demand in one place.</p></div><button class="primary" data-go="products">Explore catalogue</button></div>
+  <div class="stats">
+    <article class="stat-card"><div>Total products</div><strong id="product-count">—</strong></article>
+    <article class="stat-card"><div>Registered dealers</div><strong id="dealer-count">—</strong></article>
+    <article class="stat-card"><div>Orders</div><strong id="order-count">—</strong></article>
+    <article class="stat-card"><div>Forecast SKUs</div><strong id="forecast-count">—</strong></article>
+  </div>
+  <article class="panel"><div class="panel-heading"><h3>Product catalogue</h3><button class="text-btn" data-go="products">View all</button></div>
+  <div class="table-wrap"><table><thead><tr><th>SKU</th><th>PRODUCT</th><th>CATEGORY</th><th>PRICE</th><th>STOCK</th></tr></thead><tbody id="dashboard-products"><tr><td colspan="5">Loading…</td></tr></tbody></table></div></article>
+</section>
+
+<section id="products-view" class="view hidden">
+ <article class="panel"><div class="panel-heading"><h3>Product catalogue</h3></div>
+ <input id="product-search" class="search" placeholder="Search SKU, product, category or brand">
+ <div class="table-wrap"><table><thead><tr><th>SKU</th><th>PRODUCT</th><th>CATEGORY</th><th>BRAND</th><th>PRICE</th><th>STOCK</th></tr></thead><tbody id="products-table"></tbody></table></div>
+ <div class="pagination"><button id="prev-page">Previous</button><span id="page-info">Page 1</span><button id="next-page">Next</button></div></article>
+</section>
+
+<section id="inventory-view" class="view hidden">
+ <article class="panel"><h3>Update inventory</h3><form id="inventory-form" class="action-form">
+ <label>Product SKU<input id="inventory-sku" required placeholder="Enter SKU"></label>
+ <label>New quantity<input id="inventory-quantity" type="number" min="0" required></label>
+ <label>Reason<input id="inventory-reason" value="Manual stock update" required></label>
+ <button class="primary" type="submit">Update stock</button></form>
+ <h3>Current inventory</h3><div class="table-wrap"><table><thead><tr><th>SKU</th><th>PRODUCT</th><th>STOCK</th><th>ACTION</th></tr></thead><tbody id="inventory-table"></tbody></table></div></article>
+</section>
+
+<section id="orders-view" class="view hidden">
+ <article class="panel"><h3>Create draft order</h3><form id="order-form" class="action-form">
+ <label>Dealer code<input id="order-dealer" required placeholder="Dealer code"></label>
+ <label>Product SKU<input id="order-sku" required placeholder="Product SKU"></label>
+ <label>Quantity<input id="order-quantity" type="number" min="1" value="1" required></label>
+ <button class="primary" type="submit">Create order</button></form>
+ <h3>Orders</h3><div class="table-wrap"><table><thead><tr><th>ORDER</th><th>DEALER</th><th>STATUS</th><th>TOTAL</th><th>ACTIONS</th></tr></thead><tbody id="orders-table"></tbody></table></div></article>
+</section>
+
+<section id="forecasts-view" class="view hidden">
+ <article class="panel"><h3>Demand forecast</h3><form id="forecast-form" class="action-form"><label>Product SKU<input id="forecast-sku" required placeholder="Enter SKU"></label><button class="primary" type="submit">Get forecast</button></form><pre id="forecast-result">Enter a SKU to view its forecast.</pre>
+ <h3>Reorder suggestions</h3><button id="reorder-btn" class="primary">Load reorder suggestions</button><div class="table-wrap"><table><thead><tr><th>SKU</th><th>Stock</th><th>Lead time</th><th>Reorder point</th><th>Suggested qty</th></tr></thead><tbody id="reorder-table"></tbody></table></div></article>
+</section>
+
+<section id="assistant-view" class="view hidden">
+ <article class="panel"><h3>Dealer Assistant</h3><p>Ask about products, stock or orders.</p><div id="chat-messages" aria-live="polite"></div>
+ <form id="chat-form" class="action-form"><label>Message<input id="chat-message" required placeholder="How can I help?"></label><button class="primary" type="submit">Send</button></form></article>
+</section>
+</main>
+</body>
+</html>

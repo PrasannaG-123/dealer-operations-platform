@@ -1,0 +1,69 @@
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VIKMO DealerDesk</title>
+    {% load static %}
+    <link rel="stylesheet" href="{% static 'core/app.css' %}">
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="brand"><span class="brand-icon">V</span><div>VIKMO<small>DEALER DESK</small></div></div>
+        <p class="nav-label">WORKSPACE</p>
+        <button class="nav-item active" data-view="dashboard">▦ &nbsp; Dashboard</button>
+        <button class="nav-item" data-view="products">▤ &nbsp; Products</button>
+        <button class="nav-item" data-view="inventory">▣ &nbsp; Inventory</button>
+        <button class="nav-item" data-view="orders">⇄ &nbsp; Orders</button>
+        <button class="nav-item" data-view="forecasts">⌁ &nbsp; Forecasts</button>
+        <button class="nav-item" data-view="assistant">✧ &nbsp; AI Assistant</button>
+        <div class="sidebar-bottom"><span class="status-dot"></span> System connected<small>DealerDesk v1.0</small></div>
+    </aside>
+
+    <main class="main">
+        <header class="topbar">
+            <div><span class="eyebrow">WORKSPACE / OVERVIEW</span><h1 id="page-title">Dashboard</h1></div>
+            <div class="top-actions"><span class="live"><i></i> Live system</span><button class="icon-btn" id="refresh-btn" title="Refresh">↻</button><div class="avatar">D</div></div>
+        </header>
+
+        <section id="dashboard-view" class="view">
+            <div class="welcome"><div><span class="eyebrow">DEALER OPERATIONS</span><h2>Your business at a glance.</h2><p>Monitor products, inventory, orders and demand in one place.</p></div><button class="primary" data-go="products">Explore catalogue ↗</button></div>
+            <div class="stats">
+                <article class="stat-card"><div class="stat-top"><span>Total products</span><span class="stat-icon blue">▤</span></div><strong id="product-count">—</strong><small>Catalogue items</small></article>
+                <article class="stat-card"><div class="stat-top"><span>Registered dealers</span><span class="stat-icon purple">♙</span></div><strong id="dealer-count">—</strong><small>Dealer network</small></article>
+                <article class="stat-card"><div class="stat-top"><span>Orders</span><span class="stat-icon orange">⇄</span></div><strong id="order-count">—</strong><small>Recorded orders</small></article>
+                <article class="stat-card"><div class="stat-top"><span>Forecast SKUs</span><span class="stat-icon green">⌁</span></div><strong id="forecast-count">—</strong><small>Demand planning</small></article>
+            </div>
+            <div class="content-grid">
+                <article class="panel"><div class="panel-heading"><div><h3>Product catalogue</h3><p>Browse your latest products</p></div><button class="text-btn" data-go="products">View all →</button></div><div class="table-wrap"><table><thead><tr><th>PRODUCT</th><th>CATEGORY</th><th>PRICE</th><th>STOCK</th></tr></thead><tbody id="dashboard-products"><tr><td colspan="4">Loading products…</td></tr></tbody></table></div></article>
+                <article class="panel"><div class="panel-heading"><div><h3>Quick actions</h3><p>Jump into your workflow</p></div></div><div class="quick-actions"><button data-go="products"><span class="quick-icon blue">▤</span><span><b>Browse products</b><small>Search the catalogue</small></span><span class="arrow">→</span></button><button data-go="inventory"><span class="quick-icon orange">▣</span><span><b>Manage inventory</b><small>Review stock levels</small></span><span class="arrow">→</span></button><button data-go="forecasts"><span class="quick-icon green">⌁</span><span><b>Demand forecasts</b><small>Plan upcoming orders</small></span><span class="arrow">→</span></button><button data-go="assistant"><span class="quick-icon purple">✧</span><span><b>Dealer Assistant</b><small>Ask about products</small></span><span class="arrow">→</span></button></div></article>
+            </div>
+        </section>
+
+        <section id="products-view" class="view hidden">
+            <div class="panel"><div class="panel-heading"><div><h3>Product catalogue</h3><p>Search products and check live prices and stock.</p></div></div><input id="product-search" class="search" placeholder="Search by SKU, name, category or brand…"><div class="table-wrap"><table><thead><tr><th>SKU</th><th>PRODUCT</th><th>CATEGORY</th><th>BRAND</th><th>PRICE</th><th>STOCK</th></tr></thead><tbody id="products-table"></tbody></table></div><div class="pagination"><button id="prev-page">← Previous</button><span id="page-info">Page 1</span><button id="next-page">Next →</button></div></div>
+        </section>
+
+        <section id="inventory-view" class="view hidden">
+            <div class="panel"><div class="panel-heading"><div><h3>Inventory management</h3><p>Review stock and update quantities.</p></div></div><div class="table-wrap"><table><thead><tr><th>SKU</th><th>PRODUCT</th><th>STOCK</th><th>UPDATE QUANTITY</th><th>ACTION</th></tr></thead><tbody id="inventory-table"></tbody></table></div></div>
+        </section>
+
+        <section id="orders-view" class="view hidden">
+            <div class="panel"><div class="panel-heading"><div><h3>Orders</h3><p>Track orders and manage their status.</p></div></div><div class="table-wrap"><table><thead><tr><th>ORDER</th><th>DEALER</th><th>STATUS</th><th>CREATED</th><th>ACTION</th></tr></thead><tbody id="orders-table"></tbody></table></div><p class="hint">Order creation and status changes depend on the configured API.</p></div>
+        </section>
+
+        <section id="forecasts-view" class="view hidden">
+            <div class="panel"><div class="panel-heading"><div><h3>Demand forecasts</h3><p>Forecast demand and replenishment recommendations.</p></div><button class="primary" id="load-reorders">Load reorder suggestions</button></div><div class="table-wrap"><table><thead><tr><th>SKU</th><th>CURRENT STOCK</th><th>LEAD TIME</th><th>LEAD-TIME DEMAND</th><th>SAFETY STOCK</th><th>REORDER QTY</th></tr></thead><tbody id="forecast-table"><tr><td colspan="6">Choose “Load reorder suggestions” to begin.</td></tr></tbody></table></div></div>
+        </section>
+
+        <section id="assistant-view" class="view hidden">
+            <div class="assistant-layout"><article class="panel assistant-panel"><div class="assistant-heading"><div class="assistant-mark">✧</div><div><h3>Dealer Assistant</h3><p>Catalogue-aware support for your workflow</p></div><span class="live"><i></i> Ready</span></div><div id="chat-messages" class="chat-messages"><div class="message bot">Hello! I'm your DealerDesk assistant. Ask me about products, prices, stock availability or catalogue SKUs.</div></div><form id="chat-form" class="chat-form"><input id="chat-input" required placeholder="Ask about a product or stock…"><button class="primary" type="submit">Send ↗</button></form><p class="hint">Prices and stock answers should be verified against live catalogue data.</p></article></div>
+        </section>
+        <div id="notice" class="notice hidden"></div>
+        <footer>VIKMO DealerDesk <span>Inventory · Orders · Intelligence</span></footer>
+    </main>
+    <script src="{% static 'core/app.js' %}"></script>
+</body>
+</html>
+```
